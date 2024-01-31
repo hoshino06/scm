@@ -3,8 +3,9 @@
 Implementation of Screening Curve Method(SCM) for 
 economic analysis of photovoltaic self-consumption.
 
-Created on Tue Nov 29 11:16:51 2022
-@author: yosuke irie and hikaru hoshino
+Created on Tue Nov 29 2022
+Revised on Sut May 27 2023
+@author: Yosuke Irie and Hikaru Hoshino
 """
 import numpy as np
 import pandas as pd
@@ -32,7 +33,7 @@ class ScreeningCurveMethod:
         self.Ntime = Ntime                        
         self.W     = 365 / Nday 
         
-    def optimization(self, parameter):
+    def optimization(self, parameter, profile=False):
         """
         The screening curve method consists of three steps. 
         """
@@ -41,17 +42,25 @@ class ScreeningCurveMethod:
         self.step1_slice(parameter)
             
         # Step 2: Derive cost curve for each generation technology  
-        cost_data, Qbat = self.step2_cost_curve(parameter)
+        Cgrid     = self.cost_grid(parameter)
+        Cpv       = self.cost_pv(parameter)
+        Cwb, Qbat, Qprof = self.cost_pv_battery(parameter, profile)
+        self.cost_data = pd.concat([Cpv, Cwb, Cgrid], axis = 1)
+        self.cost_data.columns =  ["Cpv", "Cwb", "Cgrid"]              
+        self.Qbat_list = Qbat
 
         # Step 3: Derive optimal capacities of PV and battery
-        cap_pv, cap_bat = self.step3_optimal_capacity(parameter)
+        optPV, optBat, chg_prof = self.step3_optimal_capacity(parameter)
 
         # Results
-        cost_data['level'] = cost_data.index*parameter['Dslice']
-        results = {"PvCapacity"   : cap_pv,
-                   "BatCapacity"  : cap_bat,
-                   "CostCurves"   : cost_data,
-                   "Qbat"          : Qbat      }
+        self.cost_data['level'] = self.cost_data.index*parameter['Dslice']
+        results = {
+            "CostCurves"   : self.cost_data,
+            "Qbat"         : self.Qbat_list,
+            "ChargingProf" : chg_prof,
+            "PvCapacity"       : optPV,
+            "BatCapacity"      : optBat,
+             }
 
         return results 
     
@@ -84,26 +93,6 @@ class ScreeningCurveMethod:
               
         return q_load, q_spls
     
-    def step2_cost_curve(self, parameter):
-        """
-        Step 2: Derive cost curve for each generation technology 
-        """
-
-        # Read slise date obtained at step 1       
-        if not hasattr(self, 'q_spls'):
-            raise Exception('This is step2 of SCM. Please call this method after the method "step1_slice". ') 
-
-        Cgrid     = self.cost_grid(parameter)
-        Cpv       = self.cost_pv(parameter)
-        Cwb, Qbat = self.cost_pv_battery(parameter)
-    
-        cost_data = pd.concat([Cpv, Cwb, Cgrid], axis = 1)
-        cost_data.columns =  ["Cpv", "Cwb", "Cgrid"]
-       
-        self.cost_data = cost_data
-        self.Qbat_list = Qbat
-        
-        return cost_data, Qbat
 
     def step3_optimal_capacity(self, parameter):
         """
@@ -115,8 +104,7 @@ class ScreeningCurveMethod:
 
         # Read cost date obtained at step 2       
         Cost_DF         = self.cost_data 
-        Qbat_list       = self.Qbat_list  # required battery at each slice 
-        
+        Qbat_list       = self.Qbat_list   # required battery at each slice 
 
         # List of least-cost generation technology at each slice        
         min_gen = Cost_DF.idxmin(axis = 1)        
@@ -127,9 +115,16 @@ class ScreeningCurveMethod:
         
         # Optimal capacity of battery
         idx_Bat = ( min_gen == 'Cwb' )
-        opt_Bat = sum( Qbat_list[idx_Bat] )
-                      
-        return opt_PV, opt_Bat
+        opt_Bat = sum( Qbat_list[idx_Bat] )        
+        
+        # Charging profile
+        try:
+            Qprof_list = self.q_chg_prof  # charging profile for each slice       
+            chg_prof   = sum( Qprof_list[idx_Bat] )
+        except:
+            chg_prof = None
+        
+        return opt_PV, opt_Bat, chg_prof
 
 
     def cost_grid(self, parameter):
@@ -143,7 +138,7 @@ class ScreeningCurveMethod:
 
             Cgrid[i_slice] =  self.W * sum( parameter['Pbt'] * self.q_load[i_slice] )  
         
-        return  pd.Series(Cgrid) / parameter['Dslice']
+        return  pd.Series(Cgrid)
 
 
     def cost_pv(self, parameter):
@@ -158,102 +153,19 @@ class ScreeningCurveMethod:
             Cpv[i_slice] = parameter["Cfp"] * parameter["Dslice"] \
                             - self.W * sum( parameter["Pst"] * self.q_spls[i_slice] )                 
         
-        return pd.Series(Cpv) / parameter['Dslice']  
-
-    
-    def battery_capacity_and_charging_profile(self, parameter):
-        """
-        Estimation of battery capacity and charging profile
-        """
-        
-        numJ  = np.zeros(self.Nslice)
-        q_bat = np.zeros(self.Nslice)
-        q_chg = np.zeros([self.Nslice, self.Nday*self.Ntime])
-
-        # for each slice        
-        for i_slice in range(self.Nslice):
-
-            # Profile of surplus PV in matrix form 
-            q_spls_Mat  = np.reshape( self.q_spls[i_slice], (self.Nday, self.Ntime) )
-                                    
-            # Calculate surplus amount per day
-            q_spls_per_day = np.sum(q_spls_Mat, axis = 1)  
-            q_spls_per_day.sort() 
-
-            # Initialization of estimated battery amount and charging profile
-            q_bat_pre = 0
-            q_chg_pre = np.zeros( self.Nday * self.Ntime )
-            
-            # Check economic benefit of incremental battery installation for each j             
-            for j in range(self.Nday):  
-
-                # Candidate of maximum chargeable amount                           
-                QchgMax = q_spls_per_day[j]             
-
-                # Initialization of charging profile in matrix form
-                q_chg_Mat = np.zeros([self.Nday,self.Ntime])
-
-                # Calculate charging profile for given j
-                for day in range(0, self.Nday):
-
-                    # Initialization of daily battery usage
-                    total_chg = 0 
-                    flag_full = False
-                    
-                    # Calculate charging amoung for each time
-                    for time, pv_surplus in enumerate( q_spls_Mat[day] ):                                
-                        
-                        if flag_full == False:  # if not battery is full                            
-
-                            if total_chg + pv_surplus >= QchgMax: # if battery to be full
-                                flag_full = True
-                                q_chg_Mat[day][time] = QchgMax - total_chg
-                            else:
-                                q_chg_Mat[day][time] = pv_surplus
-                            
-                            total_chg = total_chg + pv_surplus
-                                
-                        else:  # if battery is already full
-                            q_chg_Mat[day][time] = 0                                                            
-                q_chg_prof = q_chg_Mat.ravel()                
-
-                # Calculate economic benefit by incremental battery capacity 
-                W = self.W
-                q_bat_diff = parameter["Echg"]*QchgMax - q_bat_pre
-                q_chg_diff = q_chg_prof - q_chg_pre
-                B = W*parameter["Pbt"]*parameter["Edis"]*parameter["Echg"] * sum(q_chg_diff) \
-                    - parameter["Cfb"] * q_bat_diff \
-                    - W * sum( parameter["Pst"] * q_chg_diff ) 
-
-                # Confirm if ther is economic benefit 
-                if B >= 0:
-                    
-                    numJ[i_slice]  = j + 1                     # update J
-                    q_bat_pre      = parameter["Echg"]*QchgMax # update battery capacity for next j
-                    q_chg_pre      = q_chg_prof                # update charging profile for next j
-                    
-                else:  # break the loop if there is no benfit                     
-                
-                    break
-
-                # Store battery capacity and charging profile
-                q_bat[i_slice] = q_bat_pre   
-                q_chg[i_slice] = q_chg_pre
-        
-        self.numJ  = numJ
-        self.q_bat = q_bat
-        self.q_chg = q_chg
-        
-        return numJ, q_bat, q_chg
+        return pd.Series(Cpv)   
     
 
-    def cost_pv_battery(self, parameter):
+    def cost_pv_battery(self, parameter, profile=False):
         """
         Derive cost curve of "installing PV with battery"
         """
+
+        # Calculation of battery capacity and charging profile        
+        # "self.q_bat", "self.q_chg_sum", "self.q_chg_prof" are calculated
+        self.battery_capacity_and_charging_profile(parameter,profile)         
         
-        self.battery_capacity_and_charging_profile(parameter) 
-        
+        # Initialization
         Qbat_sum  = 0          
         Qbat_list = np.zeros(self.Nslice)  # Amount of battery      
         Cwb_list  = np.zeros(self.Nslice)  # Cost curve 
@@ -269,7 +181,7 @@ class ScreeningCurveMethod:
                 Qbat_sum += Qbat   # Update cumulative total amount of battery
     
                 # Totol amount of charged electricity 
-                Qchg = sum( self.q_chg[i_slice] )
+                Qchg = self.q_chg_sum[i_slice]
                         
             else: # Qbat_sum >= MAXIMUM Capacity
 
@@ -279,15 +191,150 @@ class ScreeningCurveMethod:
             # Cost calculation
             W           = self.W
             p_sell      = parameter["Pst"]            
-            q_sell_prof = self.q_spls[i_slice] - self.q_chg[i_slice]
+
+            if profile == True:
+                q_sell_prof = self.q_spls[i_slice] - self.q_chg_prof[i_slice]                
+                Cwb = parameter["Cfp"] * parameter["Dslice"] + parameter["Cfb"] * Qbat \
+                      - W * sum( p_sell * q_sell_prof )  \
+                      - W * parameter["Pbt"] * parameter["Edis"] *parameter["Echg"]* Qchg       
             
-            Cwb = parameter["Cfp"] * parameter["Dslice"] + parameter["Cfb"] * Qbat \
-                  - W * sum( p_sell * q_sell_prof )  \
-                  - W * parameter["Pbt"] * parameter["Edis"] *parameter["Echg"]* Qchg       
+            elif profile == False:
+                q_sell_amount = sum(self.q_spls[i_slice]) -self.q_chg_sum[i_slice]
+                Cwb = parameter["Cfp"] * parameter["Dslice"] + parameter["Cfb"] * Qbat \
+                      - W * p_sell * q_sell_amount  \
+                      - W * parameter["Pbt"] * parameter["Edis"] *parameter["Echg"]* Qchg                
             
             # Store results                   
             Qbat_list[i_slice] = Qbat 
             Cwb_list[i_slice] = Cwb                                  
         
-        return pd.Series(Cwb_list) / parameter['Dslice'], Qbat_list
+        return pd.Series(Cwb_list), Qbat_list, self.q_chg_prof
+
+
+    
+    def battery_capacity_and_charging_profile(self, parameter,profile=False):
+        """
+        Estimation of battery capacity and charging profile
+        """
+        
+        numJ      = np.zeros(self.Nslice)
+        q_bat     = np.zeros(self.Nslice)
+        q_chg_sum = np.zeros(self.Nslice)
+        q_chg = np.zeros([self.Nslice, self.Nday*self.Ntime])
+
+        # for each slice        
+        for i_slice in range(self.Nslice):
+
+            # Profile of surplus PV in matrix form 
+            q_spls_Mat  = np.reshape( self.q_spls[i_slice], (self.Nday, self.Ntime) )
+                                    
+            # Calculate surplus amount per day
+            q_spls_per_day = np.sum(q_spls_Mat, axis = 1)  
+            q_spls_per_day.sort() 
+
+            # Initialization of estimated battery amount and charging profile
+            q_bat_pre = 0
+            q_chg_prof_pre = np.zeros( self.Nday * self.Ntime )
+            q_chg_amt_pre = 0
+            
+            # Check economic benefit of incremental battery installation for each j             
+            for j in range(self.Nday):  
+
+                # Candidate of maximum chargeable amount                           
+                QchgMax = q_spls_per_day[j]             
+                
+                # Calculate economic benefit Bj and charging profile for given j
+                if profile == True:
+                    B, q_chg_prof = self.economic_benefit_w_prof(parameter, q_spls_Mat, QchgMax, 
+                                                                 q_bat_pre, q_chg_prof_pre)   
+                    q_chg_amount = sum(q_chg_prof)
+
+                elif profile == False:                    
+                    B, q_chg_amount = self.economic_benefit_no_prof(parameter, q_spls_Mat, QchgMax, 
+                                                                  q_bat_pre, q_chg_prof_pre, j, q_spls_per_day, q_chg_amt_pre)                    
+                    q_chg_prof = None    
+                    
+                    
+                # Confirm if ther is economic benefit 
+                if B >= 0:
+                    
+                    numJ[i_slice]  = j + 1                     # update J
+                    q_bat_pre      = parameter["Echg"]*QchgMax # update battery capacity for next j
+                    q_chg_prof_pre = q_chg_prof                # update charging profile for next j
+                    q_chg_amt_pre  = q_chg_amount
+                    
+                else:  # break the loop if there is no benfit                     
+                
+                    break
+
+                # Store battery capacity and charging profile
+                q_bat[i_slice] = q_bat_pre   
+                q_chg[i_slice] = q_chg_prof_pre
+                q_chg_sum[i_slice] = q_chg_amt_pre
+        
+        self.numJ       = numJ
+        self.q_bat      = q_bat
+        self.q_chg_sum  = q_chg_sum
+        self.q_chg_prof = q_chg
+
+        
+        return numJ, q_bat, q_chg
+
+
+    def economic_benefit_no_prof(self, parameter, q_spls_Mat, QchgMax, q_bat_pre, q_chg_prof_pre, j, q_spls_per_day, q_chg_amt_pre):
+
+        # amount of electricity charged for given j
+        N = self.Nday
+        q_chg_amount = sum(q_spls_per_day[:j]) + (N-j)*QchgMax
+
+        # Calculate economic benefit by incremental battery capacity 
+        W = self.W
+        q_bat_diff = parameter["Echg"]*QchgMax - q_bat_pre
+        q_chg_diff = q_chg_amount - q_chg_amt_pre
+        B = W*parameter["Pbt"]*parameter["Edis"]*parameter["Echg"] * q_chg_diff \
+            - parameter["Cfb"] * q_bat_diff \
+            - W * parameter["Pst"] * q_chg_diff 
+    
+        return B, q_chg_amount
+
+
+    def economic_benefit_w_prof(self, parameter, q_spls_Mat, QchgMax, q_bat_pre, q_chg_prof_pre):
+
+        # Initialization of charging profile in matrix form
+        q_chg_Mat = np.zeros([self.Nday,self.Ntime])
+        
+        # Calculate charging profile for given j   
+        for day in range(0, self.Nday):
+
+            # Initialization of daily battery usage
+            total_chg = 0 
+            flag_full = False
+            
+            # Calculate charging amoung for each time
+            for time, pv_surplus in enumerate( q_spls_Mat[day] ):                                
+                
+                if flag_full == False:  # if not battery is full                            
+
+                    if total_chg + pv_surplus >= QchgMax: # if battery to be full
+                        flag_full = True
+                        q_chg_Mat[day][time] = QchgMax - total_chg
+                    else:
+                        q_chg_Mat[day][time] = pv_surplus
+                    
+                    total_chg = total_chg + pv_surplus
+                        
+                else:  # if battery is already full
+                    q_chg_Mat[day][time] = 0                                                            
+        q_chg_prof = q_chg_Mat.ravel()                
+
+        # Calculate economic benefit by incremental battery capacity 
+        W = self.W
+        q_bat_diff = parameter["Echg"]*QchgMax - q_bat_pre
+        q_chg_diff = q_chg_prof - q_chg_prof_pre
+        B = W*parameter["Pbt"]*parameter["Edis"]*parameter["Echg"] * sum(q_chg_diff) \
+            - parameter["Cfb"] * q_bat_diff \
+            - W * sum( parameter["Pst"] * q_chg_diff ) 
+    
+        return B, q_chg_prof
+
 

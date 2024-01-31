@@ -34,7 +34,7 @@ demand = demand[24*212:24*(212+Nday)]
 
 # perform SCM
 scm = SCM.ScreeningCurveMethod(pv, demand, Nday)  
-res  = scm.optimization(parameter)
+res  = scm.optimization(parameter, profile=True)
 
 # show resuts
 cap_pv  = res['PvCapacity']
